@@ -24,10 +24,13 @@ func DefaultConfig() Config {
 }
 
 // Scheduler discovers cases through adapters and runs independent batches.
+// Resource reservations are shared across batches, so scarce devices stay
+// mutually exclusive even when batches overlap in time.
 type Scheduler struct {
-	registry *Registry
-	config   Config
-	batchSeq atomic.Int64
+	registry  *Registry
+	config    Config
+	resources *resourceManager
+	batchSeq  atomic.Int64
 }
 
 // New creates a scheduler. A nil registry starts without adapters.
@@ -41,7 +44,20 @@ func New(registry *Registry, config Config) *Scheduler {
 	if config.RetryUncertain < 0 {
 		config.RetryUncertain = 0
 	}
-	return &Scheduler{registry: registry, config: config}
+	return &Scheduler{registry: registry, config: config, resources: newResourceManager()}
+}
+
+// Reservations snapshots every shared resource currently held across all
+// batches, including uncertain holds left by lost workers.
+func (s *Scheduler) Reservations() []Reservation { return s.resources.snapshot() }
+
+// ConfirmFinished records a human confirmation that a previous execution of
+// the case (typically one whose worker was lost) has actually ended, and
+// releases any resources it still holds so waiting batches can proceed. The
+// released reservations are returned as evidence; the case's recorded
+// attempts, including the original uncertain one, are left untouched.
+func (s *Scheduler) ConfirmFinished(batchID, caseID string) []Reservation {
+	return s.resources.forceRelease(batchID, caseID)
 }
 
 // Registry exposes the configured adapters.
@@ -63,14 +79,13 @@ func (s *Scheduler) Batch(ctx context.Context) (*Result, []error) {
 	for i := range cases {
 		pending[i] = i
 	}
-	locks := newResourceLocks()
 	var workerSeq atomic.Int64
 
 	for attemptNo := 1; ; attemptNo++ {
 		if len(pending) == 0 || ctx.Err() != nil {
 			break
 		}
-		next := s.runRound(ctx, id, attemptNo, cases, records, pending, locks, &workerSeq)
+		next := s.runRound(ctx, id, attemptNo, cases, records, pending, s.resources, &workerSeq)
 		if ctx.Err() != nil {
 			break
 		}
@@ -95,7 +110,7 @@ func (s *Scheduler) runRound(
 	cases []Case,
 	records []Record,
 	pending []int,
-	locks *resourceLocks,
+	resources *resourceManager,
 	workerSeq *atomic.Int64,
 ) []int {
 	var wg sync.WaitGroup
@@ -124,7 +139,7 @@ func (s *Scheduler) runRound(
 				mu.Unlock()
 				return
 			}
-			out, att, lost := s.execute(ctx, workerID, attemptNo, cases[idx], locks)
+			out, att, lost := s.execute(ctx, batchID, workerID, attemptNo, cases[idx], resources)
 			mu.Lock()
 			outcomes[idx] = out
 			attempts[idx] = att
@@ -193,12 +208,11 @@ func uncertainSoFar(r Record) int {
 	return n
 }
 
-func (s *Scheduler) execute(ctx context.Context, workerID, attemptNo int, c Case, locks *resourceLocks) (Outcome, *Attempt, bool) {
+func (s *Scheduler) execute(ctx context.Context, batchID string, workerID, attemptNo int, c Case, resources *resourceManager) (Outcome, *Attempt, bool) {
 	started := time.Now()
 	att := &Attempt{Index: attemptNo, WorkerID: workerID, StartedAt: started}
-	release := locks.acquire(ctx, c.Resources)
-	if ctx.Err() != nil {
-		release()
+	release, err := resources.acquire(ctx, Reservation{BatchID: batchID, CaseID: c.ID, WorkerID: workerID}, c.Resources)
+	if err != nil {
 		att.Outcome = OutcomeNotRun
 		att.EndedAt = time.Now()
 		return OutcomeNotRun, att, false
@@ -227,6 +241,9 @@ func (s *Scheduler) execute(ctx context.Context, workerID, attemptNo int, c Case
 	case <-lost:
 		att.Outcome = OutcomeUncertain
 		att.Err = fmt.Errorf("worker %d lost contact while running %s", workerID, c.ID)
+		// The run may still be executing: keep the resource held (marked
+		// uncertain) until the run returns or a human confirms it ended.
+		resources.markUncertain(batchID, c.ID)
 	}
 	att.EndedAt = time.Now()
 	return att.Outcome, att, att.Outcome == OutcomeUncertain && isLost(lost)

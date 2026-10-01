@@ -262,3 +262,177 @@ func ExampleResult_Report() {
 	fmt.Println(res.Counts().Passed)
 	// Output: 1
 }
+
+func TestCrossBatchResourceMutualExclusion(t *testing.T) {
+	var active, maxActive atomic.Int32
+	mk := func(id string) Case {
+		return Case{ID: id, Resources: []string{"device"}, Run: func(context.Context, *Execution) Status {
+			cur := active.Add(1)
+			for {
+				if old := maxActive.Load(); cur <= old || maxActive.CompareAndSwap(old, cur) {
+					break
+				}
+			}
+			time.Sleep(15 * time.Millisecond)
+			active.Add(-1)
+			return StatusPass
+		}}
+	}
+	sched := New(NewRegistry(LocalAdapter([]Case{mk("dev/a"), mk("dev/b")})), Config{Workers: 2})
+	var wg sync.WaitGroup
+	results := make([]*Result, 3)
+	for i := range results {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			r, _ := sched.Batch(context.Background())
+			results[i] = r
+		}(i)
+	}
+	wg.Wait()
+	if got := maxActive.Load(); got != 1 {
+		t.Fatalf("device double-booked across batches, peak holders: %d", got)
+	}
+	for i, r := range results {
+		if got := r.Counts().Passed; got != 2 {
+			t.Fatalf("batch %d should pass both cases: %+v", i, r.Counts())
+		}
+	}
+	if got := sched.Reservations(); len(got) != 0 {
+		t.Fatalf("reservations leaked after batches finished: %+v", got)
+	}
+}
+
+func TestLostWorkerKeepsResourceUntilConfirmed(t *testing.T) {
+	releaseRun := make(chan struct{})
+	var calls atomic.Int32
+	zombie := Case{ID: "dev/case", Resources: []string{"device"}, Run: func(_ context.Context, exec *Execution) Status {
+		if calls.Add(1) == 1 {
+			exec.LoseWorker()
+			<-releaseRun // lost worker: the case may still be executing
+			return StatusPass
+		}
+		return StatusPass
+	}}
+	sched := New(NewRegistry(LocalAdapter([]Case{zombie})), Config{Workers: 1, RetryUncertain: 0})
+
+	first, _ := sched.Batch(context.Background())
+	rec, _ := first.RecordFor("dev/case")
+	if rec.Final != OutcomeUncertain || len(rec.Attempts) != 1 {
+		t.Fatalf("first batch should record one uncertain attempt: %+v", rec)
+	}
+	held := sched.Reservations()
+	if len(held) != 1 || held[0].Resource != "device" || !held[0].Uncertain {
+		t.Fatalf("lost worker must keep an uncertain device hold: %+v", held)
+	}
+
+	// A new batch competing for the same device must not acquire it yet.
+	done := make(chan *Result, 1)
+	go func() {
+		r, _ := sched.Batch(context.Background())
+		done <- r
+	}()
+	select {
+	case <-done:
+		t.Fatal("next batch acquired the device while the lost execution may still run")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Human confirms the old execution ended; the hold is released with
+	// evidence returned, and the original uncertain attempt is preserved.
+	released := sched.ConfirmFinished(first.BatchID, "dev/case")
+	if len(released) != 1 || released[0].Resource != "device" || !released[0].Uncertain {
+		t.Fatalf("confirm should release the uncertain device hold: %+v", released)
+	}
+	close(releaseRun)
+	var second *Result
+	select {
+	case second = <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("next batch did not proceed after confirmation")
+	}
+	if got := second.Counts().Passed; got != 1 {
+		t.Fatalf("next batch should pass after release: %+v", second.Counts())
+	}
+	if got := sched.Reservations(); len(got) != 0 {
+		t.Fatalf("reservations leaked after confirmation: %+v", got)
+	}
+	rec, _ = first.RecordFor("dev/case")
+	if rec.Attempts[0].Outcome != OutcomeUncertain {
+		t.Fatalf("confirmation must not rewrite the uncertain attempt: %+v", rec.Attempts)
+	}
+}
+
+func TestFairnessAndAccountingWithMixedDurations(t *testing.T) {
+	var active, maxActive atomic.Int32
+	mk := func(id string, d time.Duration) Case {
+		return Case{ID: id, Resources: []string{"device"}, Run: func(ctx context.Context, _ *Execution) Status {
+			cur := active.Add(1)
+			for {
+				if old := maxActive.Load(); cur <= old || maxActive.CompareAndSwap(old, cur) {
+					break
+				}
+			}
+			defer active.Add(-1)
+			select {
+			case <-time.After(d):
+				return StatusPass
+			case <-ctx.Done():
+				return Status{Outcome: OutcomeNotRun}
+			}
+		}}
+	}
+	cases := []Case{
+		mk("fast-1", time.Millisecond),
+		mk("fast-2", time.Millisecond),
+		mk("fast-3", time.Millisecond),
+		mk("slow-1", 30*time.Millisecond),
+	}
+	sched := New(NewRegistry(LocalAdapter(cases)), Config{Workers: 4})
+
+	results := make([]*Result, 4)
+	var wg sync.WaitGroup
+	// One batch is canceled mid-flight.
+	ctx, cancel := context.WithCancel(context.Background())
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		r, _ := sched.Batch(ctx)
+		results[0] = r
+	}()
+	time.Sleep(5 * time.Millisecond)
+	cancel()
+	// New batches keep arriving while the canceled one unwinds.
+	for i := 1; i < len(results); i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			r, _ := sched.Batch(context.Background())
+			results[i] = r
+		}(i)
+	}
+	wg.Wait()
+
+	if got := maxActive.Load(); got != 1 {
+		t.Fatalf("device double-booked under churn, peak holders: %d", got)
+	}
+	if got := sched.Reservations(); len(got) != 0 {
+		t.Fatalf("reservations leaked under churn: %+v", got)
+	}
+	for i, r := range results {
+		c := r.Counts()
+		if c.Total != len(cases) || c.Failed != 0 || c.Uncertain != 0 || c.Skipped != 0 {
+			t.Fatalf("batch %d has impossible counts: %+v", i, c)
+		}
+		if c.Passed+c.NotRun != c.Total {
+			t.Fatalf("batch %d counts do not add up: %+v", i, c)
+		}
+		if i > 0 && c.Passed != len(cases) {
+			t.Fatalf("batch %d should pass every case: %+v", i, c)
+		}
+	}
+	// The canceled batch must distinguish interrupted cases from failures.
+	if results[0].Counts().NotRun == 0 {
+		t.Fatalf("canceled batch should record not_run cases: %+v", results[0].Counts())
+	}
+}
