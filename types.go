@@ -68,6 +68,10 @@ type Attempt struct {
 	Err       error
 	StartedAt time.Time
 	EndedAt   time.Time
+	// Reservations lists the device reservations backing this attempt. An
+	// uncertain attempt keeps these reservations detained until a human
+	// confirms the old execution ended.
+	Reservations []string
 }
 
 // Record is the full history and final outcome of one case in a batch.
