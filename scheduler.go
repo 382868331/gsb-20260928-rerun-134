@@ -51,6 +51,36 @@ func New(registry *Registry, config Config) *Scheduler {
 // batches, including uncertain holds left by lost workers.
 func (s *Scheduler) Reservations() []Reservation { return s.resources.snapshot() }
 
+// Waiting explains every complete device combination that is queued but has
+// not received any device yet.
+func (s *Scheduler) Waiting() []WaitStatus { return s.resources.waitStatus() }
+
+// ShrinkWaitingResources narrows a waiting combination to a subset. It never
+// changes devices already delivered to a started execution.
+func (s *Scheduler) ShrinkWaitingResources(batchID, caseID string, resources []string) bool {
+	return s.resources.shrinkWaiting(batchID, caseID, resources)
+}
+
+// CancelWaitingResources cancels a combination before any device is granted.
+// Started executions must finish, lose contact, or be explicitly confirmed.
+func (s *Scheduler) CancelWaitingResources(batchID, caseID string) bool {
+	return s.resources.cancelWaiting(batchID, caseID)
+}
+
+// ResourceState returns the persistent device account.
+func (s *Scheduler) ResourceState() State { return s.resources.state() }
+
+// RestoreResourceState merges a saved device account into this scheduler.
+func (s *Scheduler) RestoreResourceState(state State) error {
+	return s.resources.restoreState(state)
+}
+
+// SaveResourceState serializes the current device account.
+func (s *Scheduler) SaveResourceState() ([]byte, error) { return s.resources.saveState() }
+
+// LoadResourceState restores a serialized device account.
+func (s *Scheduler) LoadResourceState(data []byte) error { return s.resources.loadState(data) }
+
 // ConfirmFinished records a human confirmation that a previous execution of
 // the case (typically one whose worker was lost) has actually ended, and
 // releases any resources it still holds so waiting batches can proceed. The
@@ -58,6 +88,16 @@ func (s *Scheduler) Reservations() []Reservation { return s.resources.snapshot()
 // attempts, including the original uncertain one, are left untouched.
 func (s *Scheduler) ConfirmFinished(batchID, caseID string) []Reservation {
 	return s.resources.forceRelease(batchID, caseID)
+}
+
+// ConfirmExecutionFinished releases resources held by one exact execution.
+func (s *Scheduler) ConfirmExecutionFinished(batchID, caseID string, attempt, workerID int) []Reservation {
+	return s.resources.forceReleaseExecution(Reservation{
+		BatchID:  batchID,
+		CaseID:   caseID,
+		Attempt:  attempt,
+		WorkerID: workerID,
+	})
 }
 
 // Registry exposes the configured adapters.
@@ -211,7 +251,8 @@ func uncertainSoFar(r Record) int {
 func (s *Scheduler) execute(ctx context.Context, batchID string, workerID, attemptNo int, c Case, resources *resourceManager) (Outcome, *Attempt, bool) {
 	started := time.Now()
 	att := &Attempt{Index: attemptNo, WorkerID: workerID, StartedAt: started}
-	release, err := resources.acquire(ctx, Reservation{BatchID: batchID, CaseID: c.ID, WorkerID: workerID}, c.Resources)
+	reservation := Reservation{BatchID: batchID, CaseID: c.ID, WorkerID: workerID, Attempt: attemptNo}
+	release, err := resources.acquire(ctx, reservation, c.Resources)
 	if err != nil {
 		att.Outcome = OutcomeNotRun
 		att.EndedAt = time.Now()
@@ -234,6 +275,12 @@ func (s *Scheduler) execute(ctx context.Context, batchID string, workerID, attem
 
 	select {
 	case <-ctx.Done():
+		if isLost(lost) {
+			att.Outcome = OutcomeUncertain
+			att.Err = fmt.Errorf("worker %d lost contact while running %s", workerID, c.ID)
+			resources.markUncertain(reservation)
+			break
+		}
 		att.Outcome = OutcomeNotRun
 	case st := <-done:
 		att.Outcome = normalizeOutcome(st.Outcome)
@@ -243,7 +290,7 @@ func (s *Scheduler) execute(ctx context.Context, batchID string, workerID, attem
 		att.Err = fmt.Errorf("worker %d lost contact while running %s", workerID, c.ID)
 		// The run may still be executing: keep the resource held (marked
 		// uncertain) until the run returns or a human confirms it ended.
-		resources.markUncertain(batchID, c.ID)
+		resources.markUncertain(reservation)
 	}
 	att.EndedAt = time.Now()
 	return att.Outcome, att, att.Outcome == OutcomeUncertain && isLost(lost)

@@ -436,3 +436,184 @@ func TestFairnessAndAccountingWithMixedDurations(t *testing.T) {
 		t.Fatalf("canceled batch should record not_run cases: %+v", results[0].Counts())
 	}
 }
+
+func TestOverlappingCombinationsBlockWhileDisjointCombinationsProceed(t *testing.T) {
+	manager := newResourceManager()
+	holder := Reservation{BatchID: "batch-1", CaseID: "holder", WorkerID: 1, Attempt: 1}
+	holdRelease, err := manager.acquire(context.Background(), holder, []string{"a", "b"})
+	if err != nil {
+		t.Fatalf("initial combination not granted: %v", err)
+	}
+
+	overlappingStarted := make(chan struct{})
+	go func() {
+		release, err := manager.acquire(context.Background(), Reservation{BatchID: "batch-2", CaseID: "overlap", WorkerID: 2, Attempt: 1}, []string{"b", "c"})
+		if err == nil {
+			release()
+		}
+		close(overlappingStarted)
+	}()
+	time.Sleep(10 * time.Millisecond)
+
+	disjointDone := make(chan struct{})
+	go func() {
+		defer close(disjointDone)
+		release, err := manager.acquire(context.Background(), Reservation{BatchID: "batch-3", CaseID: "disjoint", WorkerID: 3, Attempt: 1}, []string{"d", "e"})
+		if err != nil {
+			t.Errorf("disjoint combination should not be blocked: %v", err)
+			return
+		}
+		release()
+	}()
+	select {
+	case <-disjointDone:
+	case <-time.After(time.Second):
+		t.Fatal("disjoint combination was blocked by an unrelated waiting combination")
+	}
+	select {
+	case <-overlappingStarted:
+		t.Fatal("overlapping combination started before the holder released devices")
+	default:
+	}
+
+	waiting := manager.waitStatus()
+	if len(waiting) != 1 || waiting[0].CaseID != "overlap" {
+		t.Fatalf("unexpected waiters: %+v", waiting)
+	}
+	if len(waiting[0].Missing) != 1 || waiting[0].Missing[0].Resource != "b" || waiting[0].Missing[0].Holder.CaseID != "holder" {
+		t.Fatalf("wait reason must identify the missing device and holder: %+v", waiting[0].Missing)
+	}
+	if holds := manager.snapshot(); len(holds) != 2 {
+		t.Fatalf("waiting combination must not pre-hold devices: %+v", holds)
+	}
+
+	holdRelease()
+	select {
+	case <-overlappingStarted:
+	case <-time.After(time.Second):
+		t.Fatal("overlapping combination did not proceed after devices became available")
+	}
+}
+
+func TestShrinkAndCancelOnlyAffectWaitingCombinations(t *testing.T) {
+	manager := newResourceManager()
+	holderRelease, _ := manager.acquire(context.Background(), Reservation{BatchID: "batch-1", CaseID: "holder", WorkerID: 1, Attempt: 1}, []string{"a"})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	granted := make(chan func(), 1)
+	go func() {
+		release, err := manager.acquire(ctx, Reservation{BatchID: "batch-2", CaseID: "waiting", WorkerID: 2, Attempt: 1}, []string{"a", "b"})
+		if err == nil {
+			granted <- release
+		}
+	}()
+	time.Sleep(10 * time.Millisecond)
+
+	if manager.shrinkWaiting("batch-2", "waiting", []string{"c"}) {
+		t.Fatal("shrink accepted a resource outside the original combination")
+	}
+	if !manager.shrinkWaiting("batch-2", "waiting", []string{"b"}) {
+		t.Fatal("valid shrink was rejected")
+	}
+	holderRelease()
+	var release func()
+	select {
+	case release = <-granted:
+	case <-time.After(time.Second):
+		t.Fatal("shrunk combination did not proceed")
+	}
+	holds := manager.snapshot()
+	if len(holds) != 1 || holds[0].Resource != "b" || holds[0].CaseID != "waiting" {
+		t.Fatalf("only the shrunken combination should be held: %+v", holds)
+	}
+	if manager.cancelWaiting("batch-2", "waiting") {
+		t.Fatal("cancel must not remove a device already delivered to an execution")
+	}
+	release()
+
+	holder, _ := manager.acquire(context.Background(), Reservation{BatchID: "batch-3", CaseID: "holder", WorkerID: 3, Attempt: 1}, []string{"x"})
+	go func() {
+		_, _ = manager.acquire(ctx, Reservation{BatchID: "batch-4", CaseID: "queued", WorkerID: 4, Attempt: 1}, []string{"x"})
+	}()
+	time.Sleep(10 * time.Millisecond)
+	if !manager.cancelWaiting("batch-4", "queued") {
+		t.Fatal("waiting request could not be canceled")
+	}
+	time.Sleep(10 * time.Millisecond)
+	if waiting := manager.waitStatus(); len(waiting) != 0 {
+		t.Fatalf("canceled waiter remains visible: %+v", waiting)
+	}
+	holder()
+}
+
+func TestResourceStatePersistsLostOwnership(t *testing.T) {
+	manager := newResourceManager()
+	reservation := Reservation{BatchID: "batch-lost", CaseID: "case", WorkerID: 7, Attempt: 2, Uncertain: true}
+	release, _ := manager.acquire(context.Background(), reservation, []string{"phone", "watch"})
+	manager.markUncertain(reservation)
+	data, err := manager.saveState()
+	if err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+
+	restored := newResourceManager()
+	if err := restored.loadState(data); err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+	holds := restored.snapshot()
+	if len(holds) != 2 {
+		t.Fatalf("expected both devices restored, got %+v", holds)
+	}
+	for _, hold := range holds {
+		if hold.BatchID != "batch-lost" || hold.CaseID != "case" || hold.WorkerID != 7 || hold.Attempt != 2 || !hold.Uncertain || hold.Since.IsZero() {
+			t.Fatalf("lost ownership was not preserved: %+v", hold)
+		}
+	}
+	if err := restored.loadState(data); err == nil {
+		t.Fatal("loading the same devices again must not create double ownership")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		r, err := restored.acquire(context.Background(), Reservation{BatchID: "new", CaseID: "new", WorkerID: 1, Attempt: 1}, []string{"phone"})
+		if err == nil {
+			r()
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+		t.Fatal("restored uncertain hold was reusable without confirmation")
+	case <-time.After(50 * time.Millisecond):
+	}
+	released := restored.forceReleaseExecution(Reservation{BatchID: "batch-lost", CaseID: "case", WorkerID: 7, Attempt: 2})
+	if len(released) != 2 {
+		t.Fatalf("confirmation should release the exact restored execution: %+v", released)
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("new execution did not proceed after restoring and confirming")
+	}
+	release()
+}
+
+func TestLateReleaseAndRepeatConfirmationTargetExactExecution(t *testing.T) {
+	manager := newResourceManager()
+	old := Reservation{BatchID: "batch", CaseID: "case", WorkerID: 1, Attempt: 1}
+	oldRelease, _ := manager.acquire(context.Background(), old, []string{"device"})
+	manager.markUncertain(old)
+
+	manager.forceReleaseExecution(old)
+	new := Reservation{BatchID: "batch", CaseID: "case", WorkerID: 2, Attempt: 2}
+	newRelease, _ := manager.acquire(context.Background(), new, []string{"device"})
+	if again := manager.forceReleaseExecution(old); len(again) != 0 {
+		t.Fatalf("repeat confirmation released the new execution: %+v", again)
+	}
+	oldRelease()
+	holds := manager.snapshot()
+	if len(holds) != 1 || holds[0].WorkerID != 2 || holds[0].Attempt != 2 {
+		t.Fatalf("old execution erased or stole the new hold: %+v", holds)
+	}
+	newRelease()
+}
