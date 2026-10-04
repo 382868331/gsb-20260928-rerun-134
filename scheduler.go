@@ -60,6 +60,56 @@ func (s *Scheduler) ConfirmFinished(batchID, caseID string) []Reservation {
 	return s.resources.forceRelease(batchID, caseID)
 }
 
+// Waiting explains every requirement currently blocked on resources across
+// all batches: which capabilities are still missing, who holds them, and
+// which earlier waiters fairness serves first. A waiting case holds nothing
+// and is never reported as executing.
+func (s *Scheduler) Waiting() []WaitExplanation { return s.resources.waiting() }
+
+// ExplainWait explains why one case is still waiting for its device
+// combination. The second return value is false if the case is not waiting.
+func (s *Scheduler) ExplainWait(batchID, caseID string) (WaitExplanation, bool) {
+	owner := batchID + "/" + caseID
+	for _, ex := range s.resources.waiting() {
+		if ex.BatchID+"/"+ex.CaseID == owner {
+			return ex, true
+		}
+	}
+	return WaitExplanation{}, false
+}
+
+// CancelRequirement cancels a still-waiting device combination requirement.
+// The case is recorded as not_run; devices already granted to a worker are
+// not touched and keep following the real run state.
+func (s *Scheduler) CancelRequirement(batchID, caseID string) bool {
+	return s.resources.cancelWaiter(batchID + "/" + caseID)
+}
+
+// NarrowRequirement shrinks a still-waiting requirement to a subset of its
+// current capabilities, so a case can start once the smaller combination is
+// fully available. Widening is rejected and returns false.
+func (s *Scheduler) NarrowRequirement(batchID, caseID string, resources []string) bool {
+	return s.resources.narrowWaiter(batchID+"/"+caseID, resources)
+}
+
+// State is a persistable snapshot of resource occupancy. Saving and
+// restoring it keeps the accounting identical across a restart.
+type State struct {
+	Holds []Reservation
+}
+
+// SaveState snapshots every current hold, including uncertain ones left by
+// lost workers.
+func (s *Scheduler) SaveState() State {
+	return State{Holds: s.resources.snapshot()}
+}
+
+// RestoreState reinstates saved holds. Any resource already held is
+// rejected, so a device never ends up owned by two executions.
+func (s *Scheduler) RestoreState(st State) error {
+	return s.resources.importHolds(st.Holds)
+}
+
 // Registry exposes the configured adapters.
 func (s *Scheduler) Registry() *Registry { return s.registry }
 

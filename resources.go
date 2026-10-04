@@ -2,10 +2,16 @@ package testsched
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sort"
 	"sync"
 	"time"
 )
+
+// ErrRequirementCanceled is returned to a waiting acquisition whose resource
+// requirement was canceled before the full combination became available.
+var ErrRequirementCanceled = errors.New("resource requirement canceled")
 
 // Reservation records one shared resource currently held by a case execution.
 // Holds live on the scheduler, not on a single batch: competing batches see
@@ -36,7 +42,9 @@ type resourceManager struct {
 
 type resourceRequest struct {
 	seq       uint64
+	owner     string
 	resources []string
+	canceled  bool
 }
 
 func newResourceManager() *resourceManager {
@@ -55,11 +63,21 @@ func (m *resourceManager) acquire(ctx context.Context, res Reservation, resource
 	}
 	m.mu.Lock()
 	m.seq++
-	req := resourceRequest{seq: m.seq, resources: resources}
+	req := resourceRequest{seq: m.seq, owner: res.owner(), resources: resources}
 	m.waiters = append(m.waiters, req)
 	for {
-		if m.canGrantLocked(req) {
-			for _, name := range resources {
+		// Re-read the live request each round: it may have been narrowed
+		// or canceled while this goroutine was asleep.
+		cur := m.findWaiterLocked(req.seq)
+		if cur.canceled {
+			m.removeWaiterLocked(req.seq)
+			m.broadcastLocked()
+			m.mu.Unlock()
+			return nil, ErrRequirementCanceled
+		}
+		if m.canGrantLocked(cur) {
+			granted := append([]string(nil), cur.resources...)
+			for _, name := range granted {
 				r := res
 				r.Resource = name
 				r.Since = time.Now()
@@ -67,7 +85,7 @@ func (m *resourceManager) acquire(ctx context.Context, res Reservation, resource
 			}
 			m.removeWaiterLocked(req.seq)
 			m.mu.Unlock()
-			return func() { m.release(res.owner(), resources) }, nil
+			return func() { m.release(res.owner(), granted) }, nil
 		}
 		if ctx.Err() != nil {
 			m.removeWaiterLocked(req.seq)
@@ -83,6 +101,142 @@ func (m *resourceManager) acquire(ctx context.Context, res Reservation, resource
 		}
 		m.mu.Lock()
 	}
+}
+
+// cancelWaiter drops a still-waiting requirement owned by batch/case.
+// Granted holds are untouched: devices already handed to a worker keep
+// following the real run state. Returns true if a waiter was found.
+func (m *resourceManager) cancelWaiter(owner string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range m.waiters {
+		if m.waiters[i].owner == owner {
+			m.waiters[i].canceled = true
+			m.broadcastLocked()
+			return true
+		}
+	}
+	return false
+}
+
+// narrowWaiter shrinks a still-waiting requirement to a subset of its
+// current resources. Widening and empty sets are rejected; granted holds
+// are unaffected.
+func (m *resourceManager) narrowWaiter(owner string, resources []string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range m.waiters {
+		if m.waiters[i].owner != owner {
+			continue
+		}
+		cur := map[string]bool{}
+		for _, r := range m.waiters[i].resources {
+			cur[r] = true
+		}
+		next := dedupeSorted(append([]string(nil), resources...))
+		sort.Strings(next)
+		if len(next) == 0 {
+			return false
+		}
+		for _, r := range next {
+			if !cur[r] {
+				return false
+			}
+		}
+		m.waiters[i].resources = next
+		m.broadcastLocked()
+		return true
+	}
+	return false
+}
+
+func (m *resourceManager) findWaiterLocked(seq uint64) resourceRequest {
+	for _, w := range m.waiters {
+		if w.seq == seq {
+			return w
+		}
+	}
+	return resourceRequest{seq: seq, canceled: true}
+}
+
+// WaitExplanation describes why one waiting requirement has not started:
+// the capabilities it still lacks, who currently holds them, and which
+// earlier competing waiters are ahead of it in the fair queue.
+type WaitExplanation struct {
+	BatchID  string
+	CaseID   string
+	Required []string
+	Missing  []string
+	// HeldBy maps each missing capability to the batch/case owner holding
+	// it. Uncertain holds (lost workers) are included: they are not safely
+	// reusable until confirmed.
+	HeldBy map[string]string
+	// Uncertain lists missing capabilities held by lost workers.
+	Uncertain []string
+	// AheadOf lists owners of earlier waiters competing for the same
+	// capabilities, which fairness serves first.
+	AheadOf []string
+}
+
+// waiting explains every currently waiting requirement.
+func (m *resourceManager) waiting() []WaitExplanation {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]WaitExplanation, 0, len(m.waiters))
+	for i, w := range m.waiters {
+		ex := WaitExplanation{
+			Required: append([]string(nil), w.resources...),
+			HeldBy:   map[string]string{},
+		}
+		ex.BatchID, ex.CaseID = splitOwner(w.owner)
+		for _, name := range w.resources {
+			if r, ok := m.holds[name]; ok {
+				ex.Missing = append(ex.Missing, name)
+				ex.HeldBy[name] = r.owner()
+				if r.Uncertain {
+					ex.Uncertain = append(ex.Uncertain, name)
+				}
+			}
+		}
+		for _, earlier := range m.waiters[:i] {
+			if sharesAny(earlier.resources, w.resources) {
+				ex.AheadOf = append(ex.AheadOf, earlier.owner)
+			}
+		}
+		out = append(out, ex)
+	}
+	return out
+}
+
+func splitOwner(owner string) (batchID, caseID string) {
+	for i, c := range owner {
+		if c == '/' {
+			return owner[:i], owner[i+1:]
+		}
+	}
+	return owner, ""
+}
+
+// importHolds restores previously saved holds, refusing any resource that
+// is already held so a device can never belong to two executions at once.
+func (m *resourceManager) importHolds(holds []Reservation) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, r := range holds {
+		if r.Resource == "" {
+			return fmt.Errorf("saved hold with empty resource")
+		}
+		if _, ok := m.holds[r.Resource]; ok {
+			return fmt.Errorf("resource %s already held", r.Resource)
+		}
+	}
+	for _, r := range holds {
+		m.holds[r.Resource] = r
+	}
+	if len(holds) > 0 {
+		m.broadcastLocked()
+	}
+	return nil
 }
 
 func (m *resourceManager) canGrantLocked(req resourceRequest) bool {
