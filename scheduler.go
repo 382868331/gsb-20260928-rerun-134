@@ -107,6 +107,48 @@ func (s *Scheduler) LoadReservations(r io.Reader) ([]Reservation, error) {
 	return s.resources.importHolds(saved), nil
 }
 
+// LedgerVersion returns the current resource ledger version. Every grant,
+// release, force release, uncertain marking, shrink, cancel, or import
+// advances it, so a saved version pins the exact ledger state an observation
+// (such as a Simulation) was derived from.
+func (s *Scheduler) LedgerVersion() uint64 { return s.resources.ledgerVersion() }
+
+// Simulate answers a read-only what-if question about the wait queue: if
+// the given holds had ended and the given waiters had shrunk, which full
+// combinations could proceed and which would still be blocked by earlier
+// intersecting combinations. Nothing is acquired, released, shrunk, or
+// canceled; the run works on a private copy of the ledger and leaves every
+// real reservation and waiter untouched. The returned Simulation records
+// the ledger version it was derived from.
+func (s *Scheduler) Simulate(req SimulationRequest) Simulation {
+	return s.resources.simulate(req)
+}
+
+// SimulationStatus checks a saved Simulation against the current ledger.
+// When the ledger has not moved since the simulation, every conclusion
+// still stands. Otherwise it reports which conclusions (proceed/blocked
+// verdicts for specific waiters) are affected by the observed changes and
+// must be recomputed via a fresh Simulate call.
+func (s *Scheduler) SimulationStatus(sim Simulation) (stale bool, recompute []string) {
+	return s.resources.simulationStatus(sim)
+}
+
+// SaveSimulation writes a Simulation as JSON. The saved document carries
+// the ledger version it was derived from, so a later reader can call
+// SimulationStatus to learn which conclusions the ledger has invalidated.
+func (s *Scheduler) SaveSimulation(w io.Writer, sim Simulation) error {
+	return json.NewEncoder(w).Encode(sim)
+}
+
+// LoadSimulation reads a Simulation saved by SaveSimulation.
+func (s *Scheduler) LoadSimulation(r io.Reader) (Simulation, error) {
+	var sim Simulation
+	if err := json.NewDecoder(r).Decode(&sim); err != nil {
+		return Simulation{}, err
+	}
+	return sim, nil
+}
+
 // Registry exposes the configured adapters.
 func (s *Scheduler) Registry() *Registry { return s.registry }
 

@@ -35,6 +35,7 @@ type resourceManager struct {
 	mu      sync.Mutex
 	changed chan struct{}
 	seq     uint64
+	version uint64
 	holds   map[string]Reservation
 	waiters []resourceRequest
 }
@@ -110,11 +111,13 @@ func (m *resourceManager) acquire(ctx context.Context, res Reservation, resource
 				m.holds[name] = r
 			}
 			m.removeWaiterLocked(req.seq)
+			m.version++
 			m.mu.Unlock()
 			return func() { m.release(res.owner(), granted) }, nil
 		}
 		if ctx.Err() != nil {
 			m.removeWaiterLocked(req.seq)
+			m.version++
 			m.broadcastLocked()
 			m.mu.Unlock()
 			return nil, ctx.Err()
@@ -162,12 +165,17 @@ func (m *resourceManager) canGrantLocked(req resourceRequest) bool {
 func (m *resourceManager) release(owner string, resources []string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	changed := false
 	for _, name := range resources {
 		if r, ok := m.holds[name]; ok && r.owner() == owner {
 			delete(m.holds, name)
+			changed = true
 		}
 	}
-	m.broadcastLocked()
+	if changed {
+		m.version++
+		m.broadcastLocked()
+	}
 }
 
 // forceRelease drops every hold owned by the given batch/case, regardless of
@@ -186,6 +194,7 @@ func (m *resourceManager) forceRelease(batchID, caseID string) []Reservation {
 	}
 	if len(released) > 0 {
 		sort.Slice(released, func(i, j int) bool { return released[i].Resource < released[j].Resource })
+		m.version++
 		m.broadcastLocked()
 	}
 	return released
@@ -197,12 +206,27 @@ func (m *resourceManager) markUncertain(batchID, caseID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	owner := batchID + "/" + caseID
+	changed := false
 	for name, r := range m.holds {
-		if r.owner() == owner {
+		if r.owner() == owner && !r.Uncertain {
 			r.Uncertain = true
 			m.holds[name] = r
+			changed = true
 		}
 	}
+	if changed {
+		m.version++
+	}
+}
+
+// ledgerVersion returns the current ledger version. Every mutation of holds
+// or waiters (grant, release, force release, uncertain marking, shrink,
+// cancel, import) increments it, so a saved version identifies exactly the
+// ledger state a read-only observation was derived from.
+func (m *resourceManager) ledgerVersion() uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.version
 }
 
 func (m *resourceManager) snapshot() []Reservation {
@@ -301,6 +325,7 @@ func (m *resourceManager) shrink(batchID, caseID string, keep []string) bool {
 		changed = true
 	}
 	if changed {
+		m.version++
 		m.broadcastLocked()
 	}
 	return changed
@@ -321,6 +346,7 @@ func (m *resourceManager) cancelWait(batchID, caseID string) bool {
 		}
 	}
 	if changed {
+		m.version++
 		m.broadcastLocked()
 	}
 	return changed
@@ -348,6 +374,7 @@ func (m *resourceManager) importHolds(rs []Reservation) []Reservation {
 		m.holds[r.Resource] = r
 	}
 	if len(m.holds) > 0 {
+		m.version++
 		m.broadcastLocked()
 	}
 	sort.Slice(conflicts, func(i, j int) bool { return conflicts[i].Resource < conflicts[j].Resource })
