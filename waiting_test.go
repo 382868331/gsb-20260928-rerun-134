@@ -373,3 +373,145 @@ func TestIntersectingCombinationsFairDisjointNotBlocked(t *testing.T) {
 		t.Fatalf("earlier intersecting waiter must be served first: %v", order)
 	}
 }
+
+func TestWaitingSimulationIsReadOnlyAndReportsFairnessBarriers(t *testing.T) {
+	rm := newResourceManager()
+	rm.holds["a"] = Reservation{Resource: "a", BatchID: "batch-hold", CaseID: "holder-a", WorkerID: 1}
+	rm.holds["d"] = Reservation{Resource: "d", BatchID: "batch-hold", CaseID: "holder-d", WorkerID: 1}
+	rm.waiters = []resourceRequest{
+		{seq: 1, batchID: "batch-1", caseID: "ab", workerID: 10, resources: []string{"a", "b"}, since: time.Now()},
+		{seq: 2, batchID: "batch-1", caseID: "bc", workerID: 11, resources: []string{"b", "c"}, since: time.Now()},
+		{seq: 3, batchID: "batch-1", caseID: "e-only", workerID: 12, resources: []string{"e"}, since: time.Now()},
+	}
+	sched := New(NewRegistry(LocalAdapter(nil)), DefaultConfig())
+	sched.resources = rm
+
+	sim, err := sched.SimulateWaiting(WaitingWhatIf{
+		Finished: []ResourceOwner{{BatchID: "batch-hold", CaseID: "holder-a"}},
+	})
+	if err != nil {
+		t.Fatalf("simulate: %v", err)
+	}
+	if sim.LedgerVersion != 0 {
+		t.Fatalf("new ledger should record version 0, got %d", sim.LedgerVersion)
+	}
+	if got := casesByID(sim.Ready); !sameStringSet(got, []string{"ab", "e-only"}) {
+		t.Fatalf("ready combinations = %v", got)
+	}
+	blocked := casesByID(sim.Blocked)
+	if len(blocked) != 1 || blocked[0] != "bc" {
+		t.Fatalf("bc should remain blocked, got %v", blocked)
+	}
+	bc := sim.Blocked[0]
+	if len(bc.Missing) != 0 || len(bc.EarlierBlockers) != 1 || bc.EarlierBlockers[0].CaseID != "ab" {
+		t.Fatalf("bc should be blocked only by the earlier cross-combination: %+v", bc)
+	}
+	if len(sim.Released) != 1 || len(sim.Released[0].Reservations) != 1 || sim.Released[0].Reservations[0].Resource != "a" {
+		t.Fatalf("simulation should describe the hypothetical release: %+v", sim.Released)
+	}
+	if got := sched.Reservations(); len(got) != 2 {
+		t.Fatalf("simulation changed live reservations: %+v", got)
+	}
+	live := sched.Waiting()
+	if len(live) != 3 || live[0].CaseID != "ab" || !sameStringSet(live[0].Resources, []string{"a", "b"}) {
+		t.Fatalf("simulation changed the live wait queue: %+v", live)
+	}
+}
+
+func TestWaitingSimulationShrinkShowsWhichLaterCombinationsCanProceed(t *testing.T) {
+	rm := newResourceManager()
+	rm.waiters = []resourceRequest{
+		{seq: 1, batchID: "batch-1", caseID: "ab", workerID: 10, resources: []string{"a", "b"}, since: time.Now()},
+		{seq: 2, batchID: "batch-1", caseID: "bc", workerID: 11, resources: []string{"b", "c"}, since: time.Now()},
+	}
+	sched := New(NewRegistry(LocalAdapter(nil)), DefaultConfig())
+	sched.resources = rm
+
+	sim, err := sched.SimulateWaiting(WaitingWhatIf{
+		Shrinks: []WaiterShrink{{BatchID: "batch-1", CaseID: "ab", Keep: []string{"a"}}},
+	})
+	if err != nil {
+		t.Fatalf("simulate shrink: %v", err)
+	}
+	if got := casesByID(sim.Ready); !sameStringSet(got, []string{"ab", "bc"}) {
+		t.Fatalf("shrinking ab away from b should release bc: ready=%v blocked=%+v", got, sim.Blocked)
+	}
+	if len(sim.Shrunk) != 1 || !sameStringSet(sim.Shrunk[0].From, []string{"a", "b"}) || !sameStringSet(sim.Shrunk[0].Keep, []string{"a"}) {
+		t.Fatalf("simulation should record the hypothetical shrink: %+v", sim.Shrunk)
+	}
+	if !sameStringSet(sched.Waiting()[0].Resources, []string{"a", "b"}) {
+		t.Fatal("simulated shrink must not modify live waiter")
+	}
+
+	if _, err := sched.SimulateWaiting(WaitingWhatIf{
+		Shrinks: []WaiterShrink{{BatchID: "batch-1", CaseID: "ab", Keep: []string{"z"}}},
+	}); err == nil {
+		t.Fatal("shrink outside the combination must be rejected")
+	}
+	if _, err := sched.SimulateWaiting(WaitingWhatIf{
+		Shrinks: []WaiterShrink{{BatchID: "batch-1", CaseID: "missing", Keep: []string{"a"}}},
+	}); err == nil {
+		t.Fatal("shrink for a non-waiter must be rejected")
+	}
+}
+
+func TestSavedWaitingSimulationTracksLedgerVersion(t *testing.T) {
+	rm := newResourceManager()
+	rm.holds["a"] = Reservation{Resource: "a", BatchID: "batch-hold", CaseID: "holder-a", WorkerID: 1}
+	rm.holds["d"] = Reservation{Resource: "d", BatchID: "batch-hold", CaseID: "holder-d", WorkerID: 1}
+	rm.waiters = []resourceRequest{
+		{seq: 1, batchID: "batch-1", caseID: "ab", workerID: 10, resources: []string{"a", "b"}, since: time.Now()},
+		{seq: 2, batchID: "batch-1", caseID: "e-only", workerID: 12, resources: []string{"e"}, since: time.Now()},
+	}
+	sched := New(NewRegistry(LocalAdapter(nil)), DefaultConfig())
+	sched.resources = rm
+
+	var buf bytes.Buffer
+	if err := sched.SaveWaitingSimulation(&buf, WaitingWhatIf{
+		Finished: []ResourceOwner{{BatchID: "batch-hold", CaseID: "holder-a"}},
+	}); err != nil {
+		t.Fatalf("save simulation: %v", err)
+	}
+	saved, err := sched.LoadWaitingSimulation(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatalf("load simulation: %v", err)
+	}
+	if saved.LedgerVersion != 0 || len(saved.Ready) != 2 {
+		t.Fatalf("saved simulation lost version or conclusions: %+v", saved)
+	}
+
+	rm.importHolds([]Reservation{{Resource: "d2", BatchID: "batch-hold", CaseID: "holder-d2", WorkerID: 2}})
+	fresh := sched.WaitingSimulationFreshness(saved)
+	if fresh.Current || fresh.CurrentVersion != saved.LedgerVersion+1 {
+		t.Fatalf("ledger change should advance past saved version: %+v", fresh)
+	}
+	if len(fresh.StaleConclusions) != 0 {
+		t.Fatalf("unrelated d2 change should not invalidate a/b/e conclusions: %+v", fresh)
+	}
+
+	sched.ConfirmFinished("batch-hold", "holder-a")
+	fresh = sched.WaitingSimulationFreshness(saved)
+	if fresh.Current {
+		t.Fatal("release should make simulation stale")
+	}
+	stale := conclusionCases(fresh.StaleConclusions)
+	if len(stale) != 1 || stale[0] != "ab" {
+		t.Fatalf("only ab depends on released a, got %+v", fresh)
+	}
+}
+
+func casesByID(waiters []SimulatedWaiter) []string {
+	out := make([]string, 0, len(waiters))
+	for _, waiter := range waiters {
+		out = append(out, waiter.CaseID)
+	}
+	return out
+}
+
+func conclusionCases(conclusions []SimulationConclusion) []string {
+	out := make([]string, 0, len(conclusions))
+	for _, conclusion := range conclusions {
+		out = append(out, conclusion.CaseID)
+	}
+	return out
+}

@@ -69,6 +69,47 @@ func (s *Scheduler) ConfirmFinished(batchID, caseID string) []Reservation {
 // only starts once its full combination can be granted atomically.
 func (s *Scheduler) Waiting() []Waiter { return s.resources.waiting() }
 
+// SimulateWaiting evaluates what would happen if the named current
+// occupations ended and/or named waiting combinations shrank. The
+// simulation is read-only: live reservations, waiters, arrival order, and
+// execution state are never modified. The returned snapshot records the
+// ledger/queue version used to calculate its conclusions.
+func (s *Scheduler) SimulateWaiting(what WaitingWhatIf) (WaitingSimulation, error) {
+	return s.resources.simulateWaiting(what, time.Now())
+}
+
+// SaveWaitingSimulation computes and writes a read-only waiting simulation
+// as JSON. The document includes the ledger/queue version at generation
+// time so later consumers can detect stale conclusions.
+func (s *Scheduler) SaveWaitingSimulation(w io.Writer, what WaitingWhatIf) error {
+	sim, err := s.SimulateWaiting(what)
+	if err != nil {
+		return err
+	}
+	return json.NewEncoder(w).Encode(sim)
+}
+
+// LoadWaitingSimulation reads a simulation previously saved by
+// SaveWaitingSimulation. Loading does not import reservations or alter the
+// live queue; use WaitingSimulationFreshness to see whether its conclusions
+// must be recomputed.
+func (s *Scheduler) LoadWaitingSimulation(r io.Reader) (WaitingSimulation, error) {
+	var sim WaitingSimulation
+	if err := json.NewDecoder(r).Decode(&sim); err != nil {
+		return WaitingSimulation{}, err
+	}
+	return sim, nil
+}
+
+// WaitingSimulationFreshness compares a saved simulation with the current
+// resource ledger and waiting queue. A changed version makes affected
+// conclusions stale; queue membership or order changes conservatively
+// invalidate the saved ready/blocked conclusions because fairness depends
+// on both.
+func (s *Scheduler) WaitingSimulationFreshness(saved WaitingSimulation) SimulationFreshness {
+	return s.resources.simulationFreshness(saved)
+}
+
 // ShrinkWait reduces a pending resource request to a subset of its
 // combination, letting a case that narrowed its needs stop waiting for
 // devices it no longer requires. Only waiting requests are affected;

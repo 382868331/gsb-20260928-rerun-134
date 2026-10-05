@@ -11,6 +11,7 @@
 - 等待期间可用 `Scheduler.ShrinkWait(batchID, caseID, keep)` 把需求缩减为原组合的子集，或用 `Scheduler.CancelWait(batchID, caseID)` 取消等待（该用例记为 `not_run`）；两者只影响仍在等待的请求，已交给执行者的设备仍按真实状态记账。
 - 用例可调用 `Execution.LoseWorker()` 模拟工作者失联；该次尝试记录为 `uncertain`，调度器用新工作者编号补满容量。失联时用例可能仍在执行，其资源占用保留并标记为不确定，不会立即交给下一批；人工确认旧执行已结束后调用 `Scheduler.ConfirmFinished(batchID, caseID)` 解除占用，返回被释放的预约作为依据，原不确定尝试保留不改。
 - `Scheduler.Reservations()` 返回当前所有批次的资源占用快照，用于核对资源账目。
+- `Scheduler.SimulateWaiting(what)` 在复制的账目和等待队列上只读推演：可假设指定占用结束、指定等待者缩减，结果区分完整组合当前可继续，以及仍缺设备或被先到交叉组合阻挡的请求；`SaveWaitingSimulation` / `LoadWaitingSimulation` 保存 JSON，文件包含推演时的 `ledger_version`，`WaitingSimulationFreshness` 在账目或队列变化后指出哪些已保存结论需要重新计算。
 - `Scheduler.SaveReservations(w)` / `Scheduler.LoadReservations(r)` 以 JSON 保存并恢复资源账目；重开后归属与失联标记保持一致，`ConfirmFinished` 仍释放同一份占用。恢复时设备已被他人占用则拒绝覆盖并返回冲突清单。重复确认、缩减与取消均为幂等，不会让一台设备同时属于两个执行，也不会抹去失联事实。
 - 失败和失联结果可配置重试；`Record.Attempts` 只追加，重试成功也保留首次失败或失联记录。
 - 取消批次时，运行中与未派发的用例都记录为 `not_run`，不会误记为失败或跳过。
