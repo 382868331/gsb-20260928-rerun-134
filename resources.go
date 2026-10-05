@@ -2,10 +2,15 @@ package testsched
 
 import (
 	"context"
+	"errors"
 	"sort"
 	"sync"
 	"time"
 )
+
+// ErrWaitCanceled is returned by acquire when the pending request was
+// canceled via CancelWait before it could be granted.
+var ErrWaitCanceled = errors.New("resource wait canceled")
 
 // Reservation records one shared resource currently held by a case execution.
 // Holds live on the scheduler, not on a single batch: competing batches see
@@ -36,7 +41,26 @@ type resourceManager struct {
 
 type resourceRequest struct {
 	seq       uint64
+	batchID   string
+	caseID    string
+	workerID  int
 	resources []string
+	since     time.Time
+	canceled  bool
+}
+
+// Waiter explains why one pending resource request is still waiting: which
+// resources of the combination are currently unavailable (Missing), who
+// holds them (BlockedBy, including whether the holder is a lost worker whose
+// hold is uncertain), and the full combination originally requested.
+type Waiter struct {
+	BatchID   string
+	CaseID    string
+	WorkerID  int
+	Resources []string
+	Missing   []string
+	BlockedBy []Reservation
+	Since     time.Time
 }
 
 func newResourceManager() *resourceManager {
@@ -55,11 +79,31 @@ func (m *resourceManager) acquire(ctx context.Context, res Reservation, resource
 	}
 	m.mu.Lock()
 	m.seq++
-	req := resourceRequest{seq: m.seq, resources: resources}
+	req := resourceRequest{
+		seq:       m.seq,
+		batchID:   res.BatchID,
+		caseID:    res.CaseID,
+		workerID:  res.WorkerID,
+		resources: resources,
+		since:     time.Now(),
+	}
 	m.waiters = append(m.waiters, req)
 	for {
-		if m.canGrantLocked(req) {
-			for _, name := range resources {
+		cur, ok := m.waiterLocked(req.seq)
+		if !ok {
+			m.broadcastLocked()
+			m.mu.Unlock()
+			return nil, ErrWaitCanceled
+		}
+		if cur.canceled {
+			m.removeWaiterLocked(req.seq)
+			m.broadcastLocked()
+			m.mu.Unlock()
+			return nil, ErrWaitCanceled
+		}
+		if m.canGrantLocked(cur) {
+			granted := append([]string(nil), cur.resources...)
+			for _, name := range granted {
 				r := res
 				r.Resource = name
 				r.Since = time.Now()
@@ -67,7 +111,7 @@ func (m *resourceManager) acquire(ctx context.Context, res Reservation, resource
 			}
 			m.removeWaiterLocked(req.seq)
 			m.mu.Unlock()
-			return func() { m.release(res.owner(), resources) }, nil
+			return func() { m.release(res.owner(), granted) }, nil
 		}
 		if ctx.Err() != nil {
 			m.removeWaiterLocked(req.seq)
@@ -83,6 +127,17 @@ func (m *resourceManager) acquire(ctx context.Context, res Reservation, resource
 		}
 		m.mu.Lock()
 	}
+}
+
+// waiterLocked returns the current state of a pending request, so a blocked
+// acquire observes shrinks and cancels applied while it was waiting.
+func (m *resourceManager) waiterLocked(seq uint64) (resourceRequest, bool) {
+	for _, w := range m.waiters {
+		if w.seq == seq {
+			return w, true
+		}
+	}
+	return resourceRequest{}, false
 }
 
 func (m *resourceManager) canGrantLocked(req resourceRequest) bool {
@@ -184,4 +239,133 @@ func sharesAny(a, b []string) bool {
 		}
 	}
 	return false
+}
+
+// waiting snapshots every pending request together with an explanation:
+// which resources of the combination are still missing and which
+// reservations currently block them. Waiters never hold a partial
+// combination, so a waiting request owns nothing yet.
+func (m *resourceManager) waiting() []Waiter {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]Waiter, 0, len(m.waiters))
+	for _, w := range m.waiters {
+		if w.canceled {
+			continue
+		}
+		wt := Waiter{
+			BatchID:   w.batchID,
+			CaseID:    w.caseID,
+			WorkerID:  w.workerID,
+			Resources: append([]string(nil), w.resources...),
+			Since:     w.since,
+		}
+		seen := map[string]bool{}
+		for _, name := range w.resources {
+			if r, ok := m.holds[name]; ok {
+				wt.Missing = append(wt.Missing, name)
+				if !seen[r.owner()] {
+					seen[r.owner()] = true
+					wt.BlockedBy = append(wt.BlockedBy, r)
+				}
+			}
+		}
+		sort.Strings(wt.Missing)
+		sort.Slice(wt.BlockedBy, func(i, j int) bool { return wt.BlockedBy[i].Resource < wt.BlockedBy[j].Resource })
+		out = append(out, wt)
+	}
+	return out
+}
+
+// shrink reduces a pending request to the given subset of its resources, so
+// a case that no longer needs the full combination can proceed with less.
+// It only affects requests still waiting; holds already granted to a
+// running execution are untouched and keep reflecting the real state.
+// Returns false when no matching waiter exists or keep is not a non-empty
+// subset of the requested resources.
+func (m *resourceManager) shrink(batchID, caseID string, keep []string) bool {
+	if len(keep) == 0 {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	changed := false
+	for i, w := range m.waiters {
+		if w.batchID != batchID || w.caseID != caseID || w.canceled {
+			continue
+		}
+		if !isSubset(keep, w.resources) {
+			return false
+		}
+		m.waiters[i].resources = append([]string(nil), keep...)
+		changed = true
+	}
+	if changed {
+		m.broadcastLocked()
+	}
+	return changed
+}
+
+// cancelWait drops every pending request of the given batch/case. The
+// blocked acquire returns ErrWaitCanceled and the case is recorded as
+// not_run. Holds already granted to its executions are not affected.
+// Returns false when nothing was waiting.
+func (m *resourceManager) cancelWait(batchID, caseID string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	changed := false
+	for i, w := range m.waiters {
+		if w.batchID == batchID && w.caseID == caseID && !w.canceled {
+			m.waiters[i].canceled = true
+			changed = true
+		}
+	}
+	if changed {
+		m.broadcastLocked()
+	}
+	return changed
+}
+
+// importHolds restores previously saved reservations, e.g. after a restart.
+// A resource already held by someone else is never reassigned: conflicting
+// entries are skipped and returned so the caller can reconcile. Restored
+// holds keep their original owner and Uncertain flag, so a lost worker's
+// occupation survives the save/load round trip until it is confirmed.
+func (m *resourceManager) importHolds(rs []Reservation) []Reservation {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var conflicts []Reservation
+	for _, r := range rs {
+		if r.Resource == "" {
+			continue
+		}
+		if existing, ok := m.holds[r.Resource]; ok {
+			if existing.owner() != r.owner() {
+				conflicts = append(conflicts, r)
+			}
+			continue
+		}
+		m.holds[r.Resource] = r
+	}
+	if len(m.holds) > 0 {
+		m.broadcastLocked()
+	}
+	sort.Slice(conflicts, func(i, j int) bool { return conflicts[i].Resource < conflicts[j].Resource })
+	return conflicts
+}
+
+func isSubset(keep, resources []string) bool {
+	for _, k := range keep {
+		found := false
+		for _, r := range resources {
+			if k == r {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
 }

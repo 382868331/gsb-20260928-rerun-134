@@ -2,7 +2,9 @@ package testsched
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -58,6 +60,51 @@ func (s *Scheduler) Reservations() []Reservation { return s.resources.snapshot()
 // attempts, including the original uncertain one, are left untouched.
 func (s *Scheduler) ConfirmFinished(batchID, caseID string) []Reservation {
 	return s.resources.forceRelease(batchID, caseID)
+}
+
+// Waiting snapshots every resource request currently blocked across all
+// batches, explaining for each one which resources of its combination are
+// still missing, which executions hold them, and whether those holders are
+// uncertain (lost workers). A waiting request holds nothing itself: a case
+// only starts once its full combination can be granted atomically.
+func (s *Scheduler) Waiting() []Waiter { return s.resources.waiting() }
+
+// ShrinkWait reduces a pending resource request to a subset of its
+// combination, letting a case that narrowed its needs stop waiting for
+// devices it no longer requires. Only waiting requests are affected;
+// devices already handed to a running execution keep their real state.
+// Returns false when the case is not waiting or keep is not a non-empty
+// subset of what it requested.
+func (s *Scheduler) ShrinkWait(batchID, caseID string, keep []string) bool {
+	return s.resources.shrink(batchID, caseID, keep)
+}
+
+// CancelWait drops a pending resource request; the blocked case finishes as
+// not_run without ever holding part of its combination. Holds already
+// granted to running executions are left untouched. Returns false when the
+// case was not waiting.
+func (s *Scheduler) CancelWait(batchID, caseID string) bool {
+	return s.resources.cancelWait(batchID, caseID)
+}
+
+// SaveReservations writes the current resource ledger (including uncertain
+// holds left by lost workers) as JSON, so ownership can be reconciled after
+// a restart.
+func (s *Scheduler) SaveReservations(w io.Writer) error {
+	return json.NewEncoder(w).Encode(s.resources.snapshot())
+}
+
+// LoadReservations restores a ledger saved by SaveReservations. Restored
+// holds keep their original batch/case/worker ownership and uncertain
+// flags, so ConfirmFinished on the reloaded scheduler releases exactly the
+// same occupations. A device already held by a different execution is never
+// reassigned; conflicting entries are returned for reconciliation.
+func (s *Scheduler) LoadReservations(r io.Reader) ([]Reservation, error) {
+	var saved []Reservation
+	if err := json.NewDecoder(r).Decode(&saved); err != nil {
+		return nil, err
+	}
+	return s.resources.importHolds(saved), nil
 }
 
 // Registry exposes the configured adapters.
